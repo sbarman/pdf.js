@@ -1,7 +1,7 @@
 /* -*- Mode: Java; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- /
 /* vim: set shiftwidth=2 tabstop=2 autoindent cindent expandtab: */
 
-'use strict';
+//'use strict';
 
 /**
  * The Type2 reader code below is only used for debugging purpose since Type2
@@ -388,6 +388,9 @@ function writeToFile(aBytes, aFilePath) {
       Ci = Components.interfaces;
   var file = Cc['@mozilla.org/file/local;1'].createInstance(Ci.nsILocalFile);
   file.initWithPath(aFilePath);
+  if (file.exists())
+    file.remove(false);
+  file.create(file.NORMAL_FILE_TYPE, 0666);
 
   var stream = Cc['@mozilla.org/network/file-output-stream;1']
                  .createInstance(Ci.nsIFileOutputStream);

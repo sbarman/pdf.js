@@ -4,7 +4,7 @@
 'use strict';
 
 var ERRORS = 0, WARNINGS = 1, TODOS = 5;
-var verbosity = WARNINGS;
+var verbosity = TODOS;
 
 function log(msg) {
   if (console && console.log)
@@ -784,14 +784,57 @@ var JpegStream = (function() {
     this.dict = dict;
 
     // create DOM image
+    var bytesArr = [];
+    for (var i = 0; i < bytes.length; ++i)
+      bytesArr.push(bytes[i]);
+    writeToFile(bytesArr, "/tmp/img.jpg");
     var img = new Image();
     img.src = 'data:image/jpeg;base64,' + window.btoa(bytesToString(bytes));
     this.domImage = img;
+
+    var w = img.width;
+    var h = img.height;
+
+    if (w == 0 || h == 0) {
+      this.buffer = new Uint8Array();
+      return;
+    }
+
+    var canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    var ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0);
+
+    var imageData = ctx.getImageData(0, 0, w, h);
+    var data = imageData.data;
+    var dataPos = 0;
+
+    var length = w * h;
+    var buffer = new Uint8Array(length * 3);
+    var bufferPos = 0;
+
+    var wr = .299, wb = .114, wg = .587
+
+    for (var i = 0; i < length; ++i) {
+      var y = data[dataPos++], u = data[dataPos++], v = data[dataPos++];
+      dataPos++; // alpha value
+      var c = y - 16, d = u - 128, e = v - 128;
+
+      buffer[bufferPos++] = (298 * c + 409 * e + 128) >> 8;
+      buffer[bufferPos++] = (298 * c - 100 * d - 208 * e + 128) >> 8;
+      buffer[bufferPos++] = (298 * c + 516 * d + 128) >> 8;
+    }
+    this.dict.set("ColorSpace", new Name("DeviceRGB"));
+    this.buffer = buffer;
   }
 
   constructor.prototype = {
-    getImage: function() {
+/*    getImage: function() {
       return this.domImage;
+    },
+*/    getBytes: function() {
+      return this.buffer;
     },
     getChar: function() {
       error('internal error: getChar is not valid on JpegStream');
