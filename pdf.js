@@ -19,6 +19,7 @@ function warn(msg) {
 }
 
 function error(msg) {
+  log(backtrace());
   throw new Error(msg);
 }
 
@@ -41,6 +42,16 @@ function assert(cond, msg) {
 function assertWellFormed(cond, msg) {
   if (!cond)
     malformed(msg);
+}
+
+function backtrace() {
+  var stackStr;
+  try {
+    throw new Error();
+  } catch(e) {
+    stackStr = e.stack;
+  };
+  return stackStr.split('\n').slice(1).join('\n');
 }
 
 function shadow(obj, prop, value) {
@@ -221,6 +232,9 @@ var DecodeStream = (function() {
       if (!n)
         n = 1;
       this.pos += n;
+    },
+    reset: function decodestream_reset() {
+      this.pos = 0;
     }
   };
 
@@ -872,7 +886,6 @@ var DecryptStream = (function() {
     for (i = 0; i < n; i++)
       buffer[bufferLength++] = chunk[i];
     this.bufferLength = bufferLength;
-    this.eof = n < chunkSize;
   };
 
   return constructor;
@@ -3003,7 +3016,7 @@ var Page = (function() {
       return shadow(this, 'mediaBox',
                     ((IsArray(obj) && obj.length == 4) ? obj : null));
     },
-    startRendering: function(canvasCtx, continuation) {
+    startRendering: function(canvasCtx, continuation, onerror) {
       var self = this;
       var stats = self.stats;
       stats.compile = stats.fonts = stats.render = 0;
@@ -3014,18 +3027,26 @@ var Page = (function() {
       this.compile(gfx, fonts);
       stats.compile = Date.now();
 
-      FontLoader.bind(
+      var fontObjs = FontLoader.bind(
         fonts,
         function() {
           stats.fonts = Date.now();
           // Always defer call to display() to work around bug in
           // Firefox error reporting from XHR callbacks.
           setTimeout(function () {
-            self.display(gfx);
-            stats.render = Date.now();
-            continuation();
+            var exc = null;
+            try {
+              self.display(gfx);
+              stats.render = Date.now();
+            } catch (e) {
+              exc = e.toString();
+            }
+            continuation(exc);
           });
         });
+
+      for (var i = 0, ii = fonts.length; i < ii; ++i)
+        fonts[i].fontDict.fontObj = fontObjs[i];
     },
 
 
@@ -3471,9 +3492,9 @@ var EvalState = (function() {
     this.lineX = 0;
     this.lineY = 0;
     // Character and word spacing
-    this.charSpace = 0;
-    this.wordSpace = 0;
-    this.textHScale = 100;
+    this.charSpacing = 0;
+    this.wordSpacing = 0;
+    this.textHScale = 1;
     // Color spaces
     this.fillColorSpace = null;
     this.strokeColorSpace = null;
@@ -3588,23 +3609,9 @@ var PartialEvaluator = (function() {
     eval: function(stream, xref, resources, fonts) {
       resources = xref.fetchIfRef(resources) || new Dict();
       var xobjs = xref.fetchIfRef(resources.get('XObject')) || new Dict();
-
       var parser = new Parser(new Lexer(stream), false);
-      var objpool = [];
-
-      function emitArg(arg) {
-        if (typeof arg == 'object' || typeof arg == 'string') {
-          var index = objpool.length;
-          objpool[index] = arg;
-          return 'objpool[' + index + ']';
-        }
-        return arg;
-      }
-
-      var src = '';
-
-      var args = [];
-      var obj;
+      var args = [], argsArray = [], fnArray = [], obj;
+      
       while (!IsEOF(obj = parser.getObj())) {
         if (IsCmd(obj)) {
           var cmd = obj.cmd;
@@ -3626,10 +3633,7 @@ var PartialEvaluator = (function() {
               );
 
               if ('Form' == type.name) {
-                args[0].code = this.eval(xobj,
-                                         xref,
-                                         xobj.dict.get('Resources'),
-                                         fonts);
+                args[0].code = this.eval(xobj, xref, xobj.dict.get('Resources'), fonts);
               }
             }
           } else if (cmd == 'Tf') { // eagerly collect all fonts
@@ -3649,43 +3653,92 @@ var PartialEvaluator = (function() {
             }
           }
 
-          src += 'this.';
-          src += fn;
-          src += '(';
-          src += args.map(emitArg).join(',');
-          src += ');\n';
-
-          args.length = 0;
+          fnArray.push(fn);
+          argsArray.push(args);
+          args = [];
         } else {
           assertWellFormed(args.length <= 33, 'Too many arguments');
           args.push(obj);
         }
       }
 
-      var fn = Function('objpool', src);
-      return function(gfx) { fn.call(gfx, objpool); };
+      return function(gfx) {
+        for(var i = 0, length = argsArray.length; i < length; i++)
+          gfx[fnArray[i]].apply(gfx, argsArray[i]);
+      }
     },
 
     translateFont: function(fontDict, xref, resources) {
-      var fd = fontDict.get('FontDescriptor');
+      var fd;
+      var descendant = [];
+      var subType = fontDict.get('Subtype');
+      var compositeFont = false;
+      assertWellFormed(IsName(subType), 'invalid font Subtype');
+      
+      // If font is a composite 
+      //  - get the descendant font
+      //  - set the type according to the descendant font
+      //  - get the FontDescriptor from the descendant font
+      if (subType.name == 'Type0') {
+        var df = fontDict.get('DescendantFonts');
+        if (!df)
+          return null;
+        compositeFont = true;
+
+        if (IsRef(df)) {
+          df = xref.fetch(df);
+        }
+
+        descendant = xref.fetch(IsRef(df) ? df : df[0]);
+        subType = descendant.get('Subtype');
+        fd = descendant.get('FontDescriptor');
+      } else {
+        fd = fontDict.get('FontDescriptor');
+      }
+      
       if (!fd)
-        // XXX deprecated "special treatment" for standard
-        // fonts?  What do we need to do here?
         return null;
+      
       var descriptor = xref.fetch(fd);
 
       var fontName = descriptor.get('FontName');
       assertWellFormed(IsName(fontName), 'invalid font name');
-      fontName = fontName.name.replace('+', '_');
-
-      var fontFile = descriptor.get('FontFile', 'FontFile2', 'FontFile3');
-      if (!fontFile)
-        error('FontFile not found for font: ' + fontName);
-      fontFile = xref.fetchIfRef(fontFile);
+      fontName = fontName.name.replace(/[\+,\-]/g, '_');
 
       var encodingMap = {};
       var charset = [];
-      if (fontDict.has('Encoding')) {
+      if (compositeFont) {
+        // Special CIDFont support
+        // XXX only CIDFontType2 supported for now
+        if (subType.name == 'CIDFontType2') {
+          var cidToGidMap = descendant.get('CIDToGIDMap');
+          if (cidToGidMap && IsRef(cidToGidMap)) {
+            // Extract the charset from the CIDToGIDMap
+            var glyphsStream = xref.fetchIfRef(cidToGidMap);
+            var glyphsData = glyphsStream.getBytes(0);
+            var i = 0;
+            // Glyph ids are big-endian 2-byte values
+            for (var j=0; j<glyphsData.length; j++) {
+              var glyphID = (glyphsData[j++] << 8) | glyphsData[j];
+              charset.push(glyphID);
+            }
+          }
+        }
+        else {
+          // XXX This is a placeholder for handling of the encoding of CIDFontType0 fonts
+          var encoding = xref.fetchIfRef(fontDict.get('Encoding'));
+          if (IsName(encoding)) {
+            // Encoding is a predefined CMap
+            if (encoding.name == 'Identity-H') {
+              TODO ('Need to create an identity cmap')
+            } else {
+              TODO ('Need to support predefined CMaps see PDF 32000-1:2008 9.7.5.2 Predefined CMaps')
+            }
+          } else {
+            TODO ('Need to support encoding streams see PDF 32000-1:2008  9.7.5.3'); 
+          }
+        }
+      } else if (fontDict.has('Encoding')) {
         var encoding = xref.fetchIfRef(fontDict.get('Encoding'));
         if (IsDict(encoding)) {
           // Build a map of between codes and glyphs
@@ -3693,9 +3746,8 @@ var PartialEvaluator = (function() {
           var baseName = encoding.get('BaseEncoding');
           if (baseName) {
             var base = Encodings[baseName.name];
-            var index = 0;
             for (var j = 0, end = base.length; j < end; j++)
-              encodingMap[index++] = GlyphsUnicode[base[j]];
+              encodingMap[j] = GlyphsUnicode[base[j]] || 0;
           } else {
             TODO('need to load default encoding');
           }
@@ -3705,7 +3757,11 @@ var PartialEvaluator = (function() {
           var index = 0;
           for (var j = 0; j < differences.length; j++) {
             var data = differences[j];
-            IsNum(data) ? index = data : encodingMap[index++] = data;
+            if (subType.name == 'TrueType') {
+              IsNum(data) ? index = data : encodingMap[index++] = j;
+            } else {
+              IsNum(data) ? index = data : encodingMap[index++] = GlyphsUnicode[data.name];
+            }
           }
 
           // Get the font charset if any
@@ -3755,6 +3811,7 @@ var PartialEvaluator = (function() {
                 error('useCMap is not implemented');
                 break;
 
+              case 'beginbfchar':
               case 'beginbfrange':
               case 'begincodespacerange':
                 token = '';
@@ -3772,17 +3829,18 @@ var PartialEvaluator = (function() {
                   var code = parseInt('0x' + tokens[j + 2]);
 
                   for (var k = startRange; k <= endRange; k++) {
-                    // The encoding mapping table will be filled
-                    // later during the building phase
-                    //encodingMap[k] = GlyphsUnicode[encoding[code]];
                     charset.push(encoding[code++] || '.notdef');
                   }
                 }
                 break;
 
-              case 'beginfbchar':
-              case 'endfbchar':
-                error('fbchar parsing is not implemented');
+              case 'endbfchar':
+                for (var j = 0; j < tokens.length; j += 2) {
+                  var index = parseInt('0x' + tokens[j]);
+                  var code = parseInt('0x' + tokens[j + 1]);
+                  encodingMap[index] = GlyphsUnicode[encoding[code]];
+                  charset.push(encoding[code] || '.notdef');
+                }
                 break;
 
               default:
@@ -3801,11 +3859,29 @@ var PartialEvaluator = (function() {
         }
       }
 
-      var subType = fontDict.get('Subtype');
-      assertWellFormed(IsName(subType), 'invalid font Subtype');
+      var fontFile = descriptor.get('FontFile', 'FontFile2', 'FontFile3');
+      if (fontFile) {
+        fontFile = xref.fetchIfRef(fontFile);
+
+        if (fontFile.dict) {
+          var fileType = fontFile.dict.get('Subtype');
+          if (fileType)
+            fileType = fileType.name;
+        }
+      }
+
+      var widths = fontDict.get('Widths');
+      if (widths) {
+        var glyphWidths = {};
+        var unicode = fontDict.get('FirstChar');
+        for (var i = 0, ii = widths.length; i < ii; ++i)
+          glyphWidths[unicode++] = widths[i];
+      }
 
       var properties = {
         type: subType.name,
+        subtype: fileType,
+        widths: glyphWidths,
         encoding: encodingMap,
         charset: charset,
         firstChar: fontDict.get('FirstChar'),
@@ -3818,7 +3894,8 @@ var PartialEvaluator = (function() {
         flags: descriptor.get('Flags'),
         italicAngle: descriptor.get('ItalicAngle'),
         fixedPitch: false,
-        textMatrix: IDENTITY_MATRIX
+        textMatrix: IDENTITY_MATRIX,
+        compositeFont: compositeFont
       };
 
       return {
@@ -3836,7 +3913,7 @@ var PartialEvaluator = (function() {
 // <canvas> contexts store most of the state we need natively.
 // However, PDF needs a bit more state, which we store here.
 var CanvasExtraState = (function() {
-  function constructor() {
+  function constructor(old) {
     // Are soft masks and alpha values shapes or opacities?
     this.alphaIsShape = false;
     this.fontSize = 0;
@@ -3849,14 +3926,22 @@ var CanvasExtraState = (function() {
     this.lineX = 0;
     this.lineY = 0;
     // Character and word spacing
-    this.charSpace = 0;
-    this.wordSpace = 0;
-    this.textHScale = 100;
+    this.charSpacing = 0;
+    this.wordSpacing = 0;
+    this.textHScale = 1;
     // Color spaces
-    this.fillColorSpace = null;
-    this.strokeColorSpace = null;
+    this.fillColorSpaceObj = null;
+    this.strokeColorSpaceObj = null;
+    this.fillColorObj = null;
+    this.strokeColorObj = null;
+
+    this.old = old;
   }
+
   constructor.prototype = {
+    clone: function canvasextra_clone() {
+      return Object.create(this);
+    }
   };
   return constructor;
 })();
@@ -3869,6 +3954,9 @@ function ScratchCanvas(width, height) {
 }
 
 var CanvasGraphics = (function() {
+  var kScalePrecision = 50;
+  var kRasterizerMin = 14;
+
   function constructor(canvasCtx, imageCanvas) {
     this.ctx = canvasCtx;
     this.current = new CanvasExtraState();
@@ -3883,9 +3971,6 @@ var CanvasGraphics = (function() {
   var LINE_JOIN_STYLES = ['miter', 'round', 'bevel'];
   var NORMAL_CLIP = {};
   var EO_CLIP = {};
-
-  // Used for tiling patterns
-  var PAINT_TYPE_COLORED = 1, PAINT_TYPE_UNCOLORED = 2;
 
   constructor.prototype = {
     beginDrawing: function(mediaBox) {
@@ -3949,8 +4034,9 @@ var CanvasGraphics = (function() {
       if (this.ctx.$saveCurrentX) {
         this.ctx.$saveCurrentX();
       }
-      this.stateStack.push(this.current);
-      this.current = new CanvasExtraState();
+      var old = this.current;
+      this.stateStack.push(old);
+      this.current = old.clone();
     },
     restore: function() {
       var prev = this.stateStack.pop();
@@ -3989,7 +4075,19 @@ var CanvasGraphics = (function() {
       this.ctx.rect(x, y, width, height);
     },
     stroke: function() {
-      this.ctx.stroke();
+      var ctx = this.ctx;
+      var strokeColor = this.current.strokeColor;
+      if (strokeColor && strokeColor.type === "Pattern") {
+        // for patterns, we transform to pattern space, calculate
+        // the pattern, call stroke, and restore to user space
+        ctx.save();
+        ctx.strokeStyle = strokeColor.getPattern(ctx);
+        ctx.stroke();
+        ctx.restore();
+      } else {
+        ctx.stroke();
+      }
+
       this.consumePath();
     },
     closeStroke: function() {
@@ -3997,7 +4095,18 @@ var CanvasGraphics = (function() {
       this.stroke();
     },
     fill: function() {
-      this.ctx.fill();
+      var ctx = this.ctx;
+      var fillColor = this.current.fillColor;
+
+      if (fillColor && fillColor.type === "Pattern") {
+        ctx.save();
+        ctx.fillStyle = fillColor.getPattern(ctx);
+        ctx.fill();
+        ctx.restore();
+      } else {
+        ctx.fill();
+      }
+
       this.consumePath();
     },
     eoFill: function() {
@@ -4006,8 +4115,28 @@ var CanvasGraphics = (function() {
       this.restoreFillRule(savedFillRule);
     },
     fillStroke: function() {
-      this.ctx.fill();
-      this.ctx.stroke();
+      var ctx = this.ctx;
+
+      var fillColor = this.current.fillColor;
+      if (fillColor && fillColor.type === "Pattern") {
+        ctx.save();
+        ctx.fillStyle = fillColor.getPattern(ctx);
+        ctx.fill();
+        ctx.restore();
+      } else {
+        ctx.fill();
+      }
+      
+      var strokeColor = this.current.strokeColor;
+      if (strokeColor && strokeColor.type === "Pattern") {
+        ctx.save();
+        ctx.strokeStyle = strokeColor.getPattern(ctx);
+        ctx.stroke();
+        ctx.restore();
+      } else {
+        ctx.stroke();
+      }
+      
       this.consumePath();
     },
     eoFillStroke: function() {
@@ -4047,16 +4176,16 @@ var CanvasGraphics = (function() {
     endText: function() {
     },
     setCharSpacing: function(spacing) {
-      this.ctx.charSpacing = spacing;
+      this.current.charSpacing = spacing;
     },
     setWordSpacing: function(spacing) {
-      this.ctx.wordSpacing = spacing;
+      this.current.wordSpacing = spacing;
     },
     setHScale: function(scale) {
-      this.ctx.textHScale = (scale % 100) * 0.01;
+      this.current.textHScale = scale / 100;
     },
     setLeading: function(leading) {
-      this.current.leading = leading;
+      this.current.leading = -leading;
     },
     setFont: function(fontRef, size) {
       var font = this.xref.fetchIfRef(this.res.get('Font'));
@@ -4068,24 +4197,30 @@ var CanvasGraphics = (function() {
       if (!font)
         return;
 
-      var fontName = '';
+      var name = '';
       var fontObj = font.fontObj;
       if (fontObj)
-        fontName = fontObj.loadedName;
+        name = fontObj.loadedName;
 
-      if (!fontName) {
+      if (!name) {
         // TODO: fontDescriptor is not available, fallback to default font
-        fontName = 'sans-serif';
+        name = 'sans-serif';
       }
 
       this.current.font = fontObj;
       this.current.fontSize = size;
 
       if (this.ctx.$setFont) {
-        this.ctx.$setFont(fontName, size);
+        this.ctx.$setFont(name, size);
       } else {
-        this.ctx.font = size + 'px "' + fontName + '"';
-        Fonts.setActive(fontName, fontObj, size);
+        FontMeasure.setActive(fontObj, size);
+
+        size = (size <= kRasterizerMin) ? size * kScalePrecision : size;
+
+        var bold = fontObj.bold ? "bold" : "normal";
+        var italic = fontObj.italic ? "italic" : "normal";
+        var rule = bold + " " + italic + " " + size + 'px "' + name + '"';
+        this.ctx.font = rule;
       }
     },
     setTextRenderingMode: function(mode) {
@@ -4126,18 +4261,42 @@ var CanvasGraphics = (function() {
       ctx.save();
       ctx.transform.apply(ctx, current.textMatrix);
       ctx.scale(1, -1);
+      
+      ctx.translate(current.x, -1 * current.y);
 
-      if (this.ctx.$showText) {
-        ctx.$showText(current.y, text);
-      } else {
-        ctx.translate(current.x, -1 * current.y);
-        var font = this.current.font;
-        if (font) {
-          ctx.transform.apply(ctx, font.textMatrix);
-          text = font.charsToUnicode(text);
+      var scaleFactorX = 1, scaleFactorY = 1;
+      var font = this.current.font;
+      if (font) {
+        if (this.current.fontSize < kRasterizerMin) {
+          scaleFactorX = scaleFactorY = kScalePrecision;
+          ctx.scale(1 / scaleFactorX, 1 / scaleFactorY);
         }
+        ctx.transform.apply(ctx, font.textMatrix || IDENTITY_MATRIX);
+        text = font.charsToUnicode(text);
+      }
+
+      var charSpacing = current.charSpacing;
+      var wordSpacing = current.wordSpacing;
+      var textHScale = current.textHScale;
+
+      if (charSpacing != 0 || wordSpacing != 0 || textHScale != 1) {
+        scaleFactorX *= textHScale;
+        ctx.scale(1 / textHScale, 1);
+        var width = 0;
+
+        for (var i = 0, ii = text.length; i < ii; ++i) {
+          var c = text.charAt(i);
+          ctx.fillText(c, 0, 0);
+          var charWidth = FontMeasure.measureText(c) + charSpacing;
+          if (c.charCodeAt(0) == 32)
+            charWidth += wordSpacing;
+          ctx.translate(charWidth * scaleFactorX, 0);
+          width += charWidth;
+        }
+        current.x += width;
+      } else {
         ctx.fillText(text, 0, 0);
-        current.x += Fonts.measureText(text);
+        current.x += FontMeasure.measureText(text);
       }
 
       this.ctx.restore();
@@ -4149,7 +4308,7 @@ var CanvasGraphics = (function() {
           if (this.ctx.$addCurrentX) {
             this.ctx.$addCurrentX(-e * 0.001 * this.current.fontSize);
           } else {
-            this.current.x -= e * 0.001 * this.current.fontSize;
+            this.current.x -= e * 0.001 * this.current.fontSize * this.current.textHScale;
           }
         } else if (IsString(e)) {
           this.showText(e);
@@ -4186,167 +4345,40 @@ var CanvasGraphics = (function() {
           ColorSpace.parse(space, this.xref, this.res);
     },
     setStrokeColor: function(/*...*/) {
-      var cs = this.getStrokeColorSpace();
+      var cs = this.current.strokeColorSpace;
       var color = cs.getRgb(arguments);
       this.setStrokeRGBColor.apply(this, color);
     },
     setStrokeColorN: function(/*...*/) {
-      var cs = this.getStrokeColorSpace();
+      var cs = this.current.strokeColorSpace;
 
       if (cs.name == 'Pattern') {
-        this.ctx.strokeStyle = this.getPattern(cs, arguments);
+        // wait until fill to actually get the pattern, since Canvas
+        // calcualtes the pattern according to the current coordinate space,
+        // not the space when the pattern is set.
+        var pattern = Pattern.parse(arguments, cs, this.xref, this.res,
+                                    this.ctx);
+        this.current.strokeColor = pattern;
       } else {
         this.setStrokeColor.apply(this, arguments);
       }
     },
     setFillColor: function(/*...*/) {
-      var cs = this.getFillColorSpace();
+      var cs = this.current.fillColorSpace;
       var color = cs.getRgb(arguments);
       this.setFillRGBColor.apply(this, color);
     },
     setFillColorN: function(/*...*/) {
-      var cs = this.getFillColorSpace();
+      var cs = this.current.fillColorSpace;
 
       if (cs.name == 'Pattern') {
-        this.ctx.fillStyle = this.getPattern(cs, arguments);
+        // wait until fill to actually get the pattern
+        var pattern = Pattern.parse(arguments, cs, this.xref, this.res,
+                                    this.ctx);
+        this.current.fillColor = pattern;
       } else {
         this.setFillColor.apply(this, arguments);
       }
-    },
-    getPattern: function(cs, args) {
-      var length = args.length;
-      var base = cs.base;
-      if (base) {
-        var baseComps = base.numComps;
-
-        var color = [];
-        for (var i = 0; i < baseComps; ++i)
-          color.push(args[i]);
-
-        color = base.getRgb(color);
-      }
-
-      var patternName = args[length - 1];
-      if (!IsName(patternName))
-        error("Bad args to getPattern");
-
-      var xref = this.xref;
-      var patternRes = xref.fetchIfRef(this.res.get("Pattern"));
-      if (!patternRes)
-        error("Unable to find pattern resource");
-
-      var pattern = xref.fetchIfRef(patternRes.get(patternName.name));
-      var dict = IsStream(pattern) ? pattern.dict : pattern;
-
-      var types = [null, this.getTilingPattern, this.getShadingPattern];
-
-      var typeNum = dict.get("PatternType");
-      var patternFn = types[typeNum];
-      if (!patternFn)
-        error("Unhandled pattern type");
-      return patternFn.call(this, pattern, dict, color);
-    },
-    getShadingPattern: function(pattern, dict) {
-      var matrix = dict.get("Matrix");
-      
-      this.save();
-      this.transform.apply(this, matrix);
-      var shading = this.getShading(pattern.get("Shading"));
-      this.restore();
-
-      TODO('store transform so it can be applied before every fill');
-      return shading;
-    },
-    getTilingPattern: function(pattern, dict, color) {
-      function multiply(m, tm) {
-        var a = m[0] * tm[0] + m[1] * tm[2];
-        var b = m[0] * tm[1] + m[1] * tm[3];
-        var c = m[2] * tm[0] + m[3] * tm[2];
-        var d = m[2] * tm[1] + m[3] * tm[3];
-        var e = m[4] * tm[0] + m[5] * tm[2] + tm[4];
-        var f = m[4] * tm[1] + m[5] * tm[3] + tm[5];
-        return [a, b, c, d, e, f];
-      };
-
-      this.save();
-      var ctx = this.ctx;
-
-
-      TODO('TilingType');
-
-      var matrix = dict.get('Matrix') || IDENTITY_MATRIX;
-
-      var bbox = dict.get('BBox');
-      var x0 = bbox[0], y0 = bbox[1], x1 = bbox[2], y1 = bbox[3];
-
-      var xstep = dict.get('XStep');
-      var ystep = dict.get('YStep');
-
-      // top left corner should correspond to the top left of the bbox
-      var topLeft = this.applyTransform(x0, y0, matrix);
-      // we want the canvas to be as large as the step size
-      var botRight = this.applyTransform(x0 + xstep, y0 + ystep, matrix);
-
-      var width = botRight[0] - topLeft[0];
-      var height = botRight[1] - topLeft[1];
-
-      // TODO: hack to avoid OOM, remove then pattern code is fixed
-      if (Math.abs(width) > 8192 || Math.abs(height) > 8192) {
-        this.restore();
-        return 'hotpink';
-      }
-
-      var tmpCanvas = new this.ScratchCanvas(width, height);
-
-      // set the new canvas element context as the graphics context
-      var tmpCtx = tmpCanvas.getContext('2d');
-      var savedCtx = ctx;
-      this.ctx = tmpCtx;
-
-      var paintType = dict.get('PaintType');
-      switch (paintType) {
-      case PAINT_TYPE_COLORED:
-        tmpCtx.fillStyle = savedCtx.fillStyle;
-        tmpCtx.strokeStyle = savedCtx.strokeStyle;
-        break;
-      case PAINT_TYPE_UNCOLORED:
-        color = this.makeCssRgb.apply(this, color);
-        tmpCtx.fillStyle = color;
-        tmpCtx.strokeStyle = color;
-        break;
-      default:
-        error('Unsupported paint type');
-      }
-
-      // normalize transform matrix so each step
-      // takes up the entire tmpCanvas (need to remove white borders)
-      if (matrix[1] === 0 && matrix[2] === 0) {
-        matrix[0] = tmpCanvas.width / xstep;
-        matrix[3] = tmpCanvas.height / ystep;
-        topLeft = this.applyTransform(x0, y0, matrix);
-      }
-
-      // move the top left corner of bounding box to [0,0]
-      matrix = multiply(matrix, [1, 0, 0, 1, -topLeft[0], -topLeft[1]]);
-      
-      this.transform.apply(this, matrix);
-
-      if (bbox && IsArray(bbox) && 4 == bbox.length) {
-        this.rectangle.apply(this, bbox);
-        this.clip();
-        this.endPath();
-      }
-
-      var xref = this.xref;
-      var res = xref.fetchIfRef(dict.get('Resources'));
-      if (!pattern.code)
-        pattern.code = this.compile(pattern, xref, res, []);
-      this.execute(pattern.code, xref, res);
-
-      this.ctx = savedCtx;
-      this.restore();
-
-      return this.ctx.createPattern(tmpCanvas, 'repeat');
     },
     setStrokeGray: function(gray) {
       this.setStrokeRGBColor(gray, gray, gray);
@@ -4355,16 +4387,24 @@ var CanvasGraphics = (function() {
       this.setFillRGBColor(gray, gray, gray);
     },
     setStrokeRGBColor: function(r, g, b) {
-      this.ctx.strokeStyle = this.makeCssRgb(r, g, b);
+      var color = Util.makeCssRgb(r, g, b);
+      this.ctx.strokeStyle = color;
+      this.current.strokeColor = color;
     },
     setFillRGBColor: function(r, g, b) {
-      this.ctx.fillStyle = this.makeCssRgb(r, g, b);
+      var color = Util.makeCssRgb(r, g, b);
+      this.ctx.fillStyle = color;
+      this.current.fillColor = color;
     },
     setStrokeCMYKColor: function(c, m, y, k) {
-      this.ctx.strokeStyle = this.makeCssCmyk(c, m, y, k);
+      var color = Util.makeCssCmyk(c, m, y, k);
+      this.ctx.strokeStyle = color;
+      this.current.strokeColor = color;
     },
     setFillCMYKColor: function(c, m, y, k) {
-      this.ctx.fillStyle = this.makeCssCmyk(c, m, y, k);
+      var color = Util.makeCssCmyk(c, m, y, k);
+      this.ctx.fillStyle = color;
+      this.current.fillColor = color;
     },
 
     // Shading
@@ -4381,10 +4421,10 @@ var CanvasGraphics = (function() {
       if (!shading)
         error('No shading object found');
 
-      var shadingFill = this.getShading(shading);
+      var shadingFill = Pattern.parseShading(shading, null, xref, res, ctx);
 
       this.save();
-      ctx.fillStyle = shadingFill;
+      ctx.fillStyle = shadingFill.getPattern();
 
       var inv = ctx.mozCurrentTransformInverse;
       if (inv) {
@@ -4392,10 +4432,10 @@ var CanvasGraphics = (function() {
         var width = canvas.width;
         var height = canvas.height;
 
-        var bl = this.applyTransform(0, 0, inv);
-        var br = this.applyTransform(0, width, inv);
-        var ul = this.applyTransform(height, 0, inv);
-        var ur = this.applyTransform(height, width, inv);
+        var bl = Util.applyTransform([0, 0], inv);
+        var br = Util.applyTransform([0, width], inv);
+        var ul = Util.applyTransform([height, 0], inv);
+        var ur = Util.applyTransform([height, width], inv);
 
         var x0 = Math.min(bl[0], br[0], ul[0], ur[0]);
         var y0 = Math.min(bl[1], br[1], ul[1], ur[1]);
@@ -4414,129 +4454,6 @@ var CanvasGraphics = (function() {
       }
 
       this.restore();
-    },
-    getShading: function(shading) {
-      this.save();
-      
-      shading = this.xref.fetchIfRef(shading);
-      var dict = IsStream(shading) ? shading.dict : shading;
-
-      var bbox = dict.get('BBox');
-      if (bbox && IsArray(bbox) && 4 == bbox.length) {
-        this.rectangle.apply(this, bbox);
-        this.clip();
-        this.endPath();
-      }
-
-      var background = dict.get('Background');
-      if (background)
-        TODO('handle background colors');
-
-      var cs = dict.get('ColorSpace', 'CS');
-      cs = ColorSpace.parse(cs, this.xref, this.res);
-
-      var types = [null,
-          null,
-          this.getAxialShading,
-          this.getRadialShading];
-
-      var typeNum = dict.get('ShadingType');
-      var shadingFn = types[typeNum];
-      
-      this.restore();
-
-      // Most likely we will not implement other types of shading
-      // unless the browser supports them
-      if (!shadingFn) {
-        warn("Unknown or NYI type of shading '"+ typeNum +"'");
-        return 'hotpink';
-      }
-
-      return shadingFn.call(this, shading, cs);
-    },
-    getAxialShading: function(sh, cs) {
-      var coordsArr = sh.get('Coords');
-      var x0 = coordsArr[0], y0 = coordsArr[1],
-          x1 = coordsArr[2], y1 = coordsArr[3];
-
-      var t0 = 0.0, t1 = 1.0;
-      if (sh.has('Domain')) {
-        var domainArr = sh.get('Domain');
-        t0 = domainArr[0], t1 = domainArr[1];
-      }
-
-      var extendStart = false, extendEnd = false;
-      if (sh.has('Extend')) {
-        var extendArr = sh.get('Extend');
-        extendStart = extendArr[0], extendEnd = extendArr[1];
-        TODO('Support extend');
-      }
-      var fnObj = sh.get('Function');
-      fnObj = this.xref.fetchIfRef(fnObj);
-      if (IsArray(fnObj))
-        error('No support for array of functions');
-      else if (!IsPDFFunction(fnObj))
-        error('Invalid function');
-      var fn = new PDFFunction(this.xref, fnObj);
-
-      var gradient = this.ctx.createLinearGradient(x0, y0, x1, y1);
-
-      // 10 samples seems good enough for now, but probably won't work
-      // if there are sharp color changes. Ideally, we would implement
-      // the spec faithfully and add lossless optimizations.
-      var step = (t1 - t0) / 10;
-      var diff = t1 - t0;
-
-      for (var i = t0; i <= t1; i += step) {
-        var color = fn.func([i]);
-        var rgbColor = cs.getRgb(color);
-        gradient.addColorStop((i - t0) / diff,
-            this.makeCssRgb.apply(this, rgbColor));
-      }
-
-      return gradient;
-    },
-    getRadialShading: function(sh, cs) {
-      var coordsArr = sh.get('Coords');
-      var x0 = coordsArr[0], y0 = coordsArr[1], r0 = coordsArr[2];
-      var x1 = coordsArr[3], y1 = coordsArr[4], r1 = coordsArr[5];
-
-      var t0 = 0.0, t1 = 1.0;
-      if (sh.has('Domain')) {
-        var domainArr = sh.get('Domain');
-        t0 = domainArr[0], t1 = domainArr[1];
-      }
-
-      var extendStart = false, extendEnd = false;
-      if (sh.has('Extend')) {
-        var extendArr = sh.get('Extend');
-        extendStart = extendArr[0], extendEnd = extendArr[1];
-        TODO('Support extend');
-      }
-      var fnObj = sh.get('Function');
-      fnObj = this.xref.fetchIfRef(fnObj);
-      if (IsArray(fnObj))
-        error('No support for array of functions');
-      else if (!IsPDFFunction(fnObj))
-        error('Invalid function');
-      var fn = new PDFFunction(this.xref, fnObj);
-
-      var gradient = 
-        this.ctx.createRadialGradient(x0, y0, r0, x1, y1, r1);
-
-      // 10 samples seems good enough for now, but probably won't work
-      // if there are sharp color changes. Ideally, we would implement
-      // the spec faithfully and add lossless optimizations.
-      var step = (t1 - t0) / 10;
-      var diff = t1 - t0;
-
-      for (var i = t0; i <= t1; i += step) {
-        var color = fn.func([i]);
-        var rgbColor = cs.getRgb(color);
-        gradient.addColorStop((i - t0) / diff, 
-            this.makeCssRgb.apply(this, rgbColor));
-      }
-      return gradient;
     },
 
     // Images
@@ -4676,48 +4593,6 @@ var CanvasGraphics = (function() {
       }
       this.ctx.beginPath();
     },
-    makeCssRgb: function(r, g, b) {
-      var ri = (255 * r) | 0, gi = (255 * g) | 0, bi = (255 * b) | 0;
-      return 'rgb(' + ri + ',' + gi + ',' + bi + ')';
-    },
-    makeCssCmyk: function(c, m, y, k) {
-      // while waiting on CSS's cmyk()...
-      // http://www.ilkeratalay.com/colorspacesfaq.php#rgb
-      var ri = (255 * (1 - Math.min(1, c * (1 - k) + k))) | 0;
-      var gi = (255 * (1 - Math.min(1, m * (1 - k) + k))) | 0;
-      var bi = (255 * (1 - Math.min(1, y * (1 - k) + k))) | 0;
-      return 'rgb(' + ri + ',' + gi + ',' + bi + ')';
-    },
-    getFillColorSpace: function() {
-      var cs = this.current.fillColorSpace;
-      if (cs)
-        return cs;
-
-      var states = this.stateStack;
-      var i = states.length - 1;
-      while (i >= 0 && !(cs = states[i].fillColorSpace))
-        --i;
-
-      if (cs)
-        return cs;
-      else
-        return new DeviceRgbCS();
-    },
-    getStrokeColorSpace: function() {
-      var cs = this.current.strokeColorSpace;
-      if (cs)
-        return cs;
-
-      var states = this.stateStack;
-      var i = states.length - 1;
-      while (i >= 0 && !(cs = states[i].strokeColorSpace))
-        --i;
-
-      if (cs)
-        return cs;
-      else
-        return new DeviceRgbCS();
-    },
     // We generally keep the canvas context set for
     // nonzero-winding, and just set evenodd for the operations
     // that need them.
@@ -4729,13 +4604,28 @@ var CanvasGraphics = (function() {
     restoreFillRule: function(rule) {
       this.ctx.mozFillRule = rule;
     },
-    applyTransform: function(x0, y0, m) {
-      var xt = x0 * m[0] + y0 * m[2] + m[4];
-      var yt = x0 * m[1] + y0 * m[3] + m[5];
-      return [xt, yt];
-    }
   };
 
+  return constructor;
+})();
+
+var Util = (function() {
+  function constructor() {};
+  constructor.makeCssRgb = function makergb(r, g, b) {
+    var ri = (255 * r) | 0, gi = (255 * g) | 0, bi = (255 * b) | 0;
+    return 'rgb(' + ri + ',' + gi + ',' + bi + ')';
+  };
+  constructor.makeCssCmyk = function makecmyk(c, m, y, k) {
+    var c = (new DeviceCmykCS()).getRgb([c, m, y, k]);
+    var ri = (255 * c[0]) | 0, gi = (255 * c[1]) | 0, bi = (255 * c[2]) | 0;
+    return 'rgb(' + ri + ',' + gi + ',' + bi + ')';
+  };
+  constructor.applyTransform = function apply(p, m) {
+    var xt = p[0] * m[0] + p[1] * m[2] + m[4];
+    var yt = p[0] * m[1] + p[1] * m[3] + m[5];
+    return [xt, yt];
+  };
+  
   return constructor;
 })();
 
@@ -4848,10 +4738,10 @@ var ColorSpace = (function() {
       case 'Lab':
       case 'DeviceN':
       default:
-        error("unrecognized color space object '" + mode + "'");
+        error("unimplemented color space object '" + mode + "'");
       }
     } else {
-      error('unrecognized color space object');
+      error('unrecognized color space object: "'+ cs +"'");
     }
   };
 
@@ -5090,6 +4980,307 @@ var DeviceCmykCS = (function() {
   return constructor;
 })();
 
+var Pattern = (function() {
+  // Constructor should define this.getPattern
+  function constructor() {
+    error('should not call Pattern constructor');
+  };
+
+  constructor.prototype = {
+    // Input: current Canvas context
+    // Output: the appropriate fillStyle or strokeStyle
+    getPattern: function pattern_getStyle(ctx) {
+      error('Should not call Pattern.getStyle');
+    },
+  };
+
+  constructor.parse = function pattern_parse(args, cs, xref, res, ctx) {
+    var length = args.length;
+
+    var patternName = args[length - 1];
+    if (!IsName(patternName))
+      error("Bad args to getPattern");
+
+    var patternRes = xref.fetchIfRef(res.get("Pattern"));
+    if (!patternRes)
+      error("Unable to find pattern resource");
+
+    var pattern = xref.fetchIfRef(patternRes.get(patternName.name));
+    var dict = IsStream(pattern) ? pattern.dict : pattern;
+    var typeNum = dict.get("PatternType");
+
+    switch(typeNum) {
+    case 1:
+      var base = cs.base;
+      var color;
+      if (base) {
+        var baseComps = base.numComps;
+
+        color = [];
+        for (var i = 0; i < baseComps; ++i)
+          color.push(args[i]);
+
+        color = base.getRgb(color);
+      }
+      return new TilingPattern(pattern, dict, color, xref, ctx);
+    case 2:
+      var shading = xref.fetchIfRef(dict.get('Shading'));
+      var matrix = dict.get('Matrix');
+      return Pattern.parseShading(shading, matrix, xref, res, ctx);
+    default:
+      error('Unknown type of pattern');
+    }
+  };
+
+  constructor.parseShading = function pattern_shading(shading, matrix,
+      xref, res, ctx) {
+
+    var dict = IsStream(shading) ? shading.dict : shading;
+    var type = dict.get('ShadingType');
+
+    switch (type) {
+    case 2:
+    case 3:
+      // both radial and axial shadings are handled by RadialAxial shading
+      return new RadialAxialShading(dict, matrix, xref, res, ctx);
+    default:
+      return new DummyShading();
+    }
+  }
+  return constructor;
+})();
+
+var DummyShading = (function() {
+  function constructor() {
+    this.type = 'Pattern';
+  };
+  constructor.prototype = {
+    getPattern: function dummy_getpattern() {
+      return 'hotpink';
+    }
+  };
+  return constructor;
+})();
+
+// Radial and axial shading have very similar implementations
+// If needed, the implementations can be broken into two classes
+var RadialAxialShading = (function() {
+  function constructor(dict, matrix, xref, res, ctx) {
+    this.matrix = matrix;
+    var bbox = dict.get('BBox');
+    var background = dict.get('Background');
+    this.coordsArr = dict.get('Coords');
+    this.shadingType = dict.get('ShadingType');
+    this.type = 'Pattern';
+
+    this.ctx = ctx;
+    this.curMatrix = ctx.mozCurrentTransform;
+
+    var cs = dict.get('ColorSpace', 'CS');
+    cs = ColorSpace.parse(cs, xref, res);
+    this.cs = cs;
+
+    var t0 = 0.0, t1 = 1.0;
+    if (dict.has('Domain')) {
+      var domainArr = dict.get('Domain');
+      t0 = domainArr[0], t1 = domainArr[1];
+    }
+
+    var extendStart = false, extendEnd = false;
+    if (dict.has('Extend')) {
+      var extendArr = dict.get('Extend');
+      extendStart = extendArr[0], extendEnd = extendArr[1];
+      TODO('Support extend');
+    }
+
+    this.extendStart = extendStart;
+    this.extendEnd = extendEnd;
+
+    var fnObj = dict.get('Function');
+    fnObj = xref.fetchIfRef(fnObj);
+    if (IsArray(fnObj))
+      error('No support for array of functions');
+    else if (!IsPDFFunction(fnObj))
+      error('Invalid function');
+    var fn = new PDFFunction(xref, fnObj);
+
+    // 10 samples seems good enough for now, but probably won't work
+    // if there are sharp color changes. Ideally, we would implement
+    // the spec faithfully and add lossless optimizations.
+    var step = (t1 - t0) / 10;
+    var diff = t1 - t0;
+
+    var colorStops = [];
+    for (var i = t0; i <= t1; i += step) {
+      var color = fn.func([i]);
+      var rgbColor = Util.makeCssRgb.apply(this, cs.getRgb(color));
+      colorStops.push([(i - t0) / diff, rgbColor]);
+    }
+
+    this.colorStops = colorStops;
+  };
+
+  constructor.prototype = {
+    getPattern: function() {
+      var coordsArr = this.coordsArr;
+      var type = this.shadingType;
+      if (type == 2) {
+        var p0 = [coordsArr[0], coordsArr[1]];
+        var p1 = [coordsArr[2], coordsArr[3]];
+      } else if (type == 3) {
+        var p0 = [coordsArr[0], coordsArr[1]];
+        var p1 = [coordsArr[3], coordsArr[4]];
+        var r0 = coordsArr[2], r1 = coordsArr[5]
+      } else {
+        error()
+      }
+
+      var matrix = this.matrix;
+      if (matrix) {
+        p0 = Util.applyTransform(p0, matrix);
+        p1 = Util.applyTransform(p1, matrix);
+      }
+
+      // if the browser supports getting the tranform matrix, convert
+      // gradient coordinates from pattern space to current user space
+      var curMatrix = this.curMatrix;
+      var ctx = this.ctx;
+      if (curMatrix) {
+        var userMatrix = ctx.mozCurrentTransformInverse;
+
+        p0 = Util.applyTransform(p0, curMatrix);
+        p0 = Util.applyTransform(p0, userMatrix);
+
+        p1 = Util.applyTransform(p1, curMatrix);
+        p1 = Util.applyTransform(p1, userMatrix);
+      }
+
+      var colorStops = this.colorStops;
+      if (type == 2)
+        var grad = ctx.createLinearGradient(p0[0], p0[1], p1[0], p1[1]);
+      else if (type == 3)
+        var grad = ctx.createRadialGradient(p0[0], p0[1], r0, p1[0], p1[1], r1);
+
+      for (var i = 0, ii = colorStops.length; i < ii; ++i) {
+        var c = colorStops[i];
+        grad.addColorStop(c[0], c[1]);
+      }
+      return grad;
+    }
+  };
+  return constructor;
+})();
+
+var TilingPattern = (function() {
+  var PAINT_TYPE_COLORED = 1, PAINT_TYPE_UNCOLORED = 2;
+  
+  function constructor(pattern, dict, color, xref, ctx) {
+      function multiply(m, tm) {
+        var a = m[0] * tm[0] + m[1] * tm[2];
+        var b = m[0] * tm[1] + m[1] * tm[3];
+        var c = m[2] * tm[0] + m[3] * tm[2];
+        var d = m[2] * tm[1] + m[3] * tm[3];
+        var e = m[4] * tm[0] + m[5] * tm[2] + tm[4];
+        var f = m[4] * tm[1] + m[5] * tm[3] + tm[5];
+        return [a, b, c, d, e, f];
+      };
+
+      TODO('TilingType');
+
+      this.matrix = dict.get("Matrix");
+      this.curMatrix = ctx.mozCurrentTransform;
+      this.invMatrix = ctx.mozCurrentTransformInverse;
+      this.ctx = ctx;
+      this.type = 'Pattern';
+
+      var bbox = dict.get('BBox');
+      var x0 = bbox[0], y0 = bbox[1], x1 = bbox[2], y1 = bbox[3];
+
+      var xstep = dict.get('XStep');
+      var ystep = dict.get('YStep');
+
+      var topLeft = [x0, y0];
+      // we want the canvas to be as large as the step size
+      var botRight = [x0 + xstep, y0 + ystep]
+
+      var width = botRight[0] - topLeft[0];
+      var height = botRight[1] - topLeft[1];
+
+      // TODO: hack to avoid OOM, we would idealy compute the tiling
+      // pattern to be only as large as the acual size in device space
+      // This could be computed with .mozCurrentTransform, but still 
+      // needs to be implemented
+      while (Math.abs(width) > 512 || Math.abs(height) > 512) {
+        width = 512;
+        height = 512;
+      }
+
+      var tmpCanvas = new ScratchCanvas(width, height);
+
+      // set the new canvas element context as the graphics context
+      var tmpCtx = tmpCanvas.getContext('2d');
+      var graphics = new CanvasGraphics(tmpCtx);
+
+      var paintType = dict.get('PaintType');
+      switch (paintType) {
+      case PAINT_TYPE_COLORED:
+        tmpCtx.fillStyle = ctx.fillStyle;
+        tmpCtx.strokeStyle = ctx.strokeStyle;
+        break;
+      case PAINT_TYPE_UNCOLORED:
+        color = Util.makeCssRgb.apply(this, color);
+        tmpCtx.fillStyle = color;
+        tmpCtx.strokeStyle = color;
+        break;
+      default:
+        error('Unsupported paint type');
+      }
+
+      var scale = [width / xstep, height / ystep];
+      this.scale = scale;
+
+      // transform coordinates to pattern space
+      var tmpTranslate = [1, 0, 0, 1, -topLeft[0], -topLeft[1]];
+      var tmpScale = [scale[0], 0, 0, scale[1], 0, 0];
+      graphics.transform.apply(graphics, tmpScale);
+      graphics.transform.apply(graphics, tmpTranslate);
+
+      if (bbox && IsArray(bbox) && 4 == bbox.length) {
+        graphics.rectangle.apply(graphics, bbox);
+        graphics.clip();
+        graphics.endPath();
+      }
+
+      var res = xref.fetchIfRef(dict.get('Resources'));
+      if (!pattern.code)
+        pattern.code = graphics.compile(pattern, xref, res, []);
+      graphics.execute(pattern.code, xref, res);
+
+      this.canvas = tmpCanvas;
+  };
+
+  constructor.prototype = {
+    getPattern: function tiling_getPattern() {
+      var matrix = this.matrix;
+      var curMatrix = this.curMatrix;
+      var ctx = this.ctx;
+
+      if (curMatrix)
+        ctx.setTransform.apply(ctx, curMatrix);
+
+      if (matrix)
+        ctx.transform.apply(ctx, matrix);
+
+      var scale = this.scale;
+      ctx.scale(1 / scale[0], 1 / scale[1]);
+
+      return ctx.createPattern(this.canvas, 'repeat');
+    }
+  };
+  return constructor;
+})();
+
+
 var PDFImage = (function() {
   function constructor(xref, res, image, inline) {
     this.image = image;
@@ -5125,6 +5316,10 @@ var PDFImage = (function() {
     this.bpc = bitsPerComponent;
 
     var colorSpace = dict.get('ColorSpace', 'CS');
+    if (!colorSpace) {
+      TODO('JPX images (which don"t require color spaces');
+      colorSpace = new Name('DeviceRGB');
+    }
     this.colorSpace = ColorSpace.parse(colorSpace, xref, res);
 
     this.numComps = this.colorSpace.numComps;
