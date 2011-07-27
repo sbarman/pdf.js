@@ -797,15 +797,119 @@ var JpegStream = (function() {
     // need to be removed
     this.dict = dict;
 
+    var bytesPos = 0;
+    var adobeMarkerStart = 0;
+    var adobeMarkerLength = 0;
+
+    function readMarker() {
+      var c;
+      do {
+        do {
+          c = bytes[bytesPos++];
+        } while(c && c != 0xFF);
+
+        if (!c)
+          return c;
+
+        while (c == 0xFF)
+          c = bytes[bytesPos++];
+        
+      } while(c && c == 0);
+      return c;
+    }
+    
+    function readSomething() {
+      var length = bytes[bytesPos++];
+      length = (length << 8) | bytes[bytesPos++];
+
+      length -= 2;
+      bytesPos += length;
+    }
+
+    function readAdobeMarker() {
+      adobeMarkerStart = bytesPos - 2;
+
+      var length = bytes[bytesPos++];
+      length = (length << 8) | bytes[bytesPos++];
+
+      adobeMarkerLength = length + 2;
+
+      if (length < 14)
+        error('bad adobe');
+
+      length -= 2;
+
+      var name = "";
+      for (var i = 0; i < 12; ++i) {
+        name += String.fromCharCode(bytes[bytesPos + i]);
+      }
+
+      log(name);
+      bytesPos += length;
+    }
+
+    var doScan = false;
+    while (!doScan) {
+      var c = readMarker();
+      switch (c) {
+        case 0xc0:      // SOF0 (sequential)
+        case 0xc1:      // SOF1 (extended sequential)
+          readSomething();
+//          readBaselineSOF();
+          break;
+        case 0xc2:      // SOF2 (progressive)
+          readSomething();
+//          readProgressiveSOF();
+          break;
+        case 0xc4:      // DHT
+          readSomething();
+//          readHuffmanTables();
+          break;
+        case 0xd8:      // SOI
+          break;
+        case 0xd9:      // EOI
+          error("soemthing");
+        case 0xda:      // SOS
+          readSomething();
+//          readScanInfo();
+          doScan = true;
+          break;
+        case 0xdb:      // DQT
+          readSomething();
+//          readQuantTables();
+          break;
+        case 0xdd:      // DRI
+          readSomething();
+//          readRestartInterval();
+          break;
+        case 0xe0:      // APP0
+          readSomething();
+//          readJFIFMarker();
+          break;
+        case 0xee:      // APP14
+          readAdobeMarker();
+          break;
+        default:
+          // skip APPn / COM / etc.
+          if (c >= 0xe0) {
+            readSomething();
+          }
+          break;
+      }
+    }
+
     // create DOM image
     var bytesArr = [];
     for (var i = 0; i < bytes.length; ++i)
       bytesArr.push(bytes[i]);
+
+//    if (adobeMarkerStart)
+//      bytesArr.splice(adobeMarkerStart, adobeMarkerLength);
     writeToFile(bytesArr, "/tmp/img.jpg");
     var img = new Image();
-    img.src = 'data:image/jpeg;base64,' + window.btoa(bytesToString(bytes));
+    img.src = 'data:image/jpeg;base64,' + window.btoa(bytesToString(bytesArr));
     this.domImage = img;
-
+/*
     var w = img.width;
     var h = img.height;
 
@@ -825,29 +929,114 @@ var JpegStream = (function() {
     var dataPos = 0;
 
     var length = w * h;
-    var buffer = new Uint8Array(length * 3);
+    var buffer = new Uint8Array(length * 4);
     var bufferPos = 0;
 
+    // convert from rgb to cmyk
+    for (var i = 0; i < length; ++i) {
+      var r = data[dataPos++] / 255;
+      var g = data[dataPos++] / 255;
+      var b = data[dataPos++] / 255;
+      dataPos++; // alpha value
+
+      var c = 1 - r;
+      var m = 1 - g;
+      var y = 1 - b;
+
+      var k = c;
+      if (m < k) {
+        k = m;
+      }
+      if (y < k) {
+        k = y;
+      }
+      buffer[bufferPos++] = Math.round(255 * ((c - k) / (1 - k)));
+      buffer[bufferPos++] = Math.round(255 * ((m - k) / (1 - k)));
+      buffer[bufferPos++] = Math.round(255 * ((y - k) / (1 - k)));
+      buffer[bufferPos++] = Math.round(255 * k);
+    }
+*/
+/*
+    data = buffer;
+    dataPos = 0;
+    bufferPos = 0;
+
+    for (var i = 0; i < length; ++i) {
+      var y = data[dataPos++];
+      var cb = data[dataPos++] - 128;
+      var cr = data[dataPos++] - 128;
+      var k = data[dataPos++];
+
+      var r = y + 1.4020 * cr;
+      var g = y - .3441363 * cb - .71413636 * cr;
+      var b = y + 1.772 * cb;
+
+      r = Math.round(r);
+      g = Math.round(g);
+      b = Math.round(b);
+
+      r = r > 255 ? 255 : (r < 0 ? 0 : r);
+      g = g > 255 ? 255 : (g < 0 ? 0 : g);
+      b = b > 255 ? 255 : (b < 0 ? 0 : b);
+
+      buffer[bufferPos++] = 255 - r;
+      buffer[bufferPos++] = 255 - g;
+      buffer[bufferPos++] = 255 - b;
+      buffer[bufferPos++] = k;
+    }
+*/   
+/*    // convert to rgb
+    data = buffer;
+    dataPos = 0;
+    bufferPos = 0;
+    buffer = new Uint8Array(length * 3);
+    for (var i = 0; i < length; ++i) {
+      var c = data[dataPos++] / 255;
+      var m = data[dataPos++] / 255;
+      var y = data[dataPos++] / 255;
+      var k = data[dataPos++] / 255;
+
+      c = c * (1 - k) + k;
+      m = m * (1 - k) + k;
+      y = y * (1 - k) + k;
+
+      var r = Math.round((1 - c) * 255);
+      var g = Math.round((1 - m) * 255);
+      var b = Math.round((1 - y) * 255);
+
+      buffer[bufferPos++] = r;
+      buffer[bufferPos++] = g;
+      buffer[bufferPos++] = b;
+    }
+*/
+/*
     var wr = .299, wb = .114, wg = .587
 
     for (var i = 0; i < length; ++i) {
-      var y = data[dataPos++], u = data[dataPos++], v = data[dataPos++];
-      dataPos++; // alpha value
+      var y = data[dataPos++];
+      var u = data[dataPos++];
+      var v = data[dataPos++];
+      var k = data[dataPos++];
       var c = y - 16, d = u - 128, e = v - 128;
 
       buffer[bufferPos++] = (298 * c + 409 * e + 128) >> 8;
       buffer[bufferPos++] = (298 * c - 100 * d - 208 * e + 128) >> 8;
       buffer[bufferPos++] = (298 * c + 516 * d + 128) >> 8;
+      buffer[bufferPos++] = k; // alpha value
     }
-    this.dict.set("ColorSpace", new Name("DeviceRGB"));
-    this.buffer = buffer;
+*/    
+/*    var cs = new DeviceCmykCS();
+    buffer = cs.getRgbBuffer(buffer);
+*/
+//    this.dict.set("ColorSpace", new Name("DeviceRGB"));
+//    this.buffer = buffer;
   }
 
   constructor.prototype = {
-/*    getImage: function() {
+    getImage: function() {
       return this.domImage;
     },
-*/    getBytes: function() {
+    getBytes: function() {
       return this.buffer;
     },
     getChar: function() {
