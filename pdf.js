@@ -970,7 +970,12 @@ var JpegStream = (function() {
         m = (m - k) / (1 - k);
         y = (y - k) / (1 - k);
       }
-
+/*
+      c = c > 1 ? 1 : (c < 0 ? 0 : c);
+      m = m > 1 ? 1 : (m < 0 ? 0 : m);
+      y = y > 1 ? 1 : (y < 0 ? 0 : y);
+      k = k > 1 ? 1 : (k < 0 ? 0 : k);
+*/
       buffer[bufferPos++] = 1 - c;
       buffer[bufferPos++] = 1 - m;
       buffer[bufferPos++] = 1 - y;
@@ -1003,7 +1008,7 @@ var JpegStream = (function() {
     }
     */
     
-    /*
+    
     // convert to rgb
     data = buffer;
     dataPos = 0;
@@ -1018,16 +1023,30 @@ var JpegStream = (function() {
       c = c * (1 - k) + k;
       m = m * (1 - k) + k;
       y = y * (1 - k) + k;
+/*
+      c = c > 1 ? 1 : (c < 0 ? 0 : c);
+      m = m > 1 ? 1 : (m < 0 ? 0 : m);
+      y = y > 1 ? 1 : (y < 0 ? 0 : y);
+*/
+      if (c == undefined || m == undefined || y == undefined)
+        log('blah');
 
       var r = Math.round((1 - c) * 255);
       var g = Math.round((1 - m) * 255);
       var b = Math.round((1 - y) * 255);
 
+      if (!(r >= 0 && r <= 255))
+        log('blah');
+      if (!(r >= 0 && r <= 255))
+        log('blah');
+      if (!(r >= 0 && r <= 255))
+        log('blah');
+
       buffer[bufferPos++] = r;
       buffer[bufferPos++] = g;
       buffer[bufferPos++] = b;
     }
-    */
+    
 
 /*
     var wr = .299, wb = .114, wg = .587
@@ -1048,11 +1067,11 @@ var JpegStream = (function() {
 /*    var cs = new DeviceCmykCS();
     buffer = cs.getRgbBuffer(buffer);
 */
-    var data = new Uint8Array(buffer.length);
+/*    var data = new Uint8Array(buffer.length);
     for (var i = 0, ii = buffer.length; i < ii; ++i)
       data[i] = (255 * buffer[i]) | 0;
-    this.dict.set("ColorSpace", new Name("DeviceCMYK"));
-    this.buffer = data;
+*/    this.dict.set("ColorSpace", new Name("DeviceRGB"));
+    this.buffer = buffer;
   }
 
   constructor.prototype = {
