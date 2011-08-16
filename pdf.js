@@ -916,7 +916,7 @@ var JpegStream = (function() {
     var img = new Image();
     img.src = 'data:image/jpeg;base64,' + window.btoa(bytesToString(bytesArr));
     this.domImage = img;
-/*
+
     var w = img.width;
     var h = img.height;
 
@@ -936,7 +936,9 @@ var JpegStream = (function() {
     var dataPos = 0;
 
     var length = w * h;
-    var buffer = new Uint8Array(length * 4);
+    var buffer = [];
+    for (var i = 0, ii = length * 4; i < ii; ++i)
+      buffer.push(0);
     var bufferPos = 0;
 
     // convert from rgb to cmyk
@@ -950,58 +952,68 @@ var JpegStream = (function() {
       var m = 1 - g;
       var y = 1 - b;
 
-      var k = c;
-      if (m < k) {
+      var k = 1;
+
+      if (c < k)
+        k = c;
+      if (m < k)
         k = m;
-      }
-      if (y < k) {
+      if (y < k)
         k = y;
+
+      if (k == 1) {
+        c = 0;
+        m = 0;
+        y = 0;
+      } else {
+        c = (c - k) / (1 - k);
+        m = (m - k) / (1 - k);
+        y = (y - k) / (1 - k);
       }
-      buffer[bufferPos++] = Math.round(255 * ((c - k) / (1 - k)));
-      buffer[bufferPos++] = Math.round(255 * ((m - k) / (1 - k)));
-      buffer[bufferPos++] = Math.round(255 * ((y - k) / (1 - k)));
-      buffer[bufferPos++] = Math.round(255 * k);
+
+      buffer[bufferPos++] = 1 - c;
+      buffer[bufferPos++] = 1 - m;
+      buffer[bufferPos++] = 1 - y;
+      buffer[bufferPos++] = 1 - k;
     }
-*/
-/*
+
+    /*
     data = buffer;
     dataPos = 0;
     bufferPos = 0;
 
     for (var i = 0; i < length; ++i) {
       var y = data[dataPos++];
-      var cb = data[dataPos++] - 128;
-      var cr = data[dataPos++] - 128;
+      var cb = data[dataPos++] - .5;
+      var cr = data[dataPos++] - .5;
       var k = data[dataPos++];
 
       var r = y + 1.4020 * cr;
       var g = y - .3441363 * cb - .71413636 * cr;
       var b = y + 1.772 * cb;
 
-      r = Math.round(r);
-      g = Math.round(g);
-      b = Math.round(b);
+      r = r > 1 ? 0 : (r < 0 ? 0 : r);
+      g = g > 1 ? 0 : (g < 0 ? 0 : g);
+      b = b > 1 ? 0 : (b < 0 ? 0 : b);
 
-      r = r > 255 ? 255 : (r < 0 ? 0 : r);
-      g = g > 255 ? 255 : (g < 0 ? 0 : g);
-      b = b > 255 ? 255 : (b < 0 ? 0 : b);
-
-      buffer[bufferPos++] = 255 - r;
-      buffer[bufferPos++] = 255 - g;
-      buffer[bufferPos++] = 255 - b;
+      buffer[bufferPos++] = 1 - r;
+      buffer[bufferPos++] = 1 - g;
+      buffer[bufferPos++] = 1 - b;
       buffer[bufferPos++] = k;
     }
-*/   
-/*    // convert to rgb
+    */
+    
+    /*
+    // convert to rgb
     data = buffer;
     dataPos = 0;
     bufferPos = 0;
     buffer = new Uint8Array(length * 3);
     for (var i = 0; i < length; ++i) {
-      var c = data[dataPos++] / 255;
-      var m = data[dataPos++] / 255;
-      var y = data[dataPos++] / 255;
-      var k = data[dataPos++] / 255;
+      var c = data[dataPos++];
+      var m = data[dataPos++];
+      var y = data[dataPos++];
+      var k = data[dataPos++];
 
       c = c * (1 - k) + k;
       m = m * (1 - k) + k;
@@ -1015,7 +1027,8 @@ var JpegStream = (function() {
       buffer[bufferPos++] = g;
       buffer[bufferPos++] = b;
     }
-*/
+    */
+
 /*
     var wr = .299, wb = .114, wg = .587
 
@@ -1035,15 +1048,18 @@ var JpegStream = (function() {
 /*    var cs = new DeviceCmykCS();
     buffer = cs.getRgbBuffer(buffer);
 */
-//    this.dict.set("ColorSpace", new Name("DeviceRGB"));
-//    this.buffer = buffer;
+    var data = new Uint8Array(buffer.length);
+    for (var i = 0, ii = buffer.length; i < ii; ++i)
+      data[i] = (255 * buffer[i]) | 0;
+    this.dict.set("ColorSpace", new Name("DeviceCMYK"));
+    this.buffer = data;
   }
 
   constructor.prototype = {
-    getImage: function() {
+/*  getImage: function() {
       return this.domImage;
     },
-    getBytes: function() {
+*/  getBytes: function() {
       return this.buffer;
     },
     getChar: function() {
@@ -3441,12 +3457,12 @@ var Page = (function() {
           // Firefox error reporting from XHR callbacks.
           setTimeout(function() {
             var exc = null;
-            try {
+//            try {
               self.display(gfx);
               stats.render = Date.now();
-            } catch (e) {
-              exc = e.toString();
-            }
+//            } catch (e) {
+//              exc = e.toString();
+//            }
             continuation(exc);
           });
         });
