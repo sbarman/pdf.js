@@ -4156,9 +4156,9 @@ var PartialEvaluator = (function() {
         fd = fontDict.get('FontDescriptor');
       }
 
-      var encodingMap = {};
       var charset = [];
       if (compositeFont) {
+        var encodingMap = {};
         // Special CIDFont support
         // XXX only CIDFontType2 supported for now
         if (subType.name == 'CIDFontType2') {
@@ -4194,114 +4194,97 @@ var PartialEvaluator = (function() {
                  '9.7.5.3');
           }
         }
-      } else if (fontDict.has('Encoding')) {
-        var encoding = xref.fetchIfRef(fontDict.get('Encoding'));
-        if (IsDict(encoding)) {
-          // Build a map of between codes and glyphs
-          // Load the base encoding
-          var baseName = encoding.get('BaseEncoding');
-          if (baseName) {
-            var base = Encodings[baseName.name];
-            for (var j = 0, end = base.length; j < end; j++)
-              encodingMap[j] = GlyphsUnicode[base[j]] || 0;
-          } else {
-            TODO('need to load default encoding');
-          }
-
-          // Load the differences between the base and original
-          var differences = encoding.get('Differences');
-          var index = 0;
-          for (var j = 0; j < differences.length; j++) {
-            var data = differences[j];
-            if (IsNum(data)) {
-              index = data;
-            } else {
-              encodingMap[index++] = (subType.name == 'TrueType') ? j :
-                                     GlyphsUnicode[data.name];
+      } else {
+        if (fontDict.has('Encoding')) {
+          var encoding = xref.fetchIfRef(fontDict.get('Encoding'));
+          if (IsDict(encoding)) {
+            // Build a map of between codes and glyphs
+            // Load the base encoding
+            var baseName = encoding.get('BaseEncoding');
+            if (baseName) {
+              var baseEncoding = Encodings[baseName.name].slice();
             }
-          }
-        } else if (IsName(encoding)) {
-          var encoding = Encodings[encoding.name];
-          if (!encoding)
-            error('Unknown font encoding');
 
-          var index = 0;
-          for (var j = 0; j < encoding.length; j++)
-            encodingMap[index++] = GlyphsUnicode[encoding[j]];
-
-          // firstChar and width are required
-          // (except for 14 standard fonts)
-          var firstChar = xref.fetchIfRef(fontDict.get('FirstChar'));
-          var widths = xref.fetchIfRef(fontDict.get('Widths')) || [];
-          for (var j = 0; j < widths.length; j++) {
-            if (widths[j])
-              charset.push(encoding[j + firstChar]);
+            // Load the differences between the base and original
+            var differences = encoding.get('Differences');
+            var index = 0;
+            var diffEncoding = [];
+            for (var j = 0; j < differences.length; j++) {
+              var data = differences[j];
+              if (IsNum(data)) {
+                index = data;
+              } else {
+                diffEncoding[index++] = data.name;
+              }
+            }
+          } else if (IsName(encoding)) {
+            var baseEncoding = Encodings[encoding.name].slice();
           }
         }
-      } else if (fontDict.has('ToUnicode')) {
-        encodingMap = {empty: true};
-        var cmapObj = xref.fetchIfRef(fontDict.get('ToUnicode'));
-        if (IsName(cmapObj)) {
-          error('ToUnicode file cmap translation not implemented');
-        } else if (IsStream(cmapObj)) {
-          var encoding = Encodings['WinAnsiEncoding'];
-          var firstChar = xref.fetchIfRef(fontDict.get('FirstChar'));
+ 
+        if (fontDict.has('ToUnicode')) {
+          var toUnicode = [];
+          var cmapObj = xref.fetchIfRef(fontDict.get('ToUnicode'));
+          if (IsName(cmapObj)) {
+            error('ToUnicode file cmap translation not implemented');
+          } else if (IsStream(cmapObj)) {
+            var firstChar = xref.fetchIfRef(fontDict.get('FirstChar'));
 
-          var tokens = [];
-          var token = '';
+            var tokens = [];
+            var token = '';
 
-          var cmap = cmapObj.getBytes(cmapObj.length);
-          for (var i = 0; i < cmap.length; i++) {
-            var byte = cmap[i];
-            if (byte == 0x20 || byte == 0x0A || byte == 0x3C || byte == 0x3E) {
-              switch (token) {
-              case 'useCMap':
-                error('useCMap is not implemented');
-                break;
+            var cmap = cmapObj.getBytes(cmapObj.length);
+            for (var i = 0; i < cmap.length; i++) {
+              var byte = cmap[i];
+              if (byte == 0x20 || byte == 0x0A || byte == 0x3C || byte == 0x3E) {
+                switch (token) {
+                  case 'useCMap':
+                    error('useCMap is not implemented');
+                    break;
 
-              case 'beginbfchar':
-              case 'beginbfrange':
-              case 'begincodespacerange':
-                token = '';
-                tokens = [];
-                break;
+                  case 'beginbfchar':
+                  case 'beginbfrange':
+                  case 'begincodespacerange':
+                    token = '';
+                    tokens = [];
+                    break;
 
-              case 'endcodespacerange':
-                TODO('Support CMap ranges');
-                break;
+                  case 'endcodespacerange':
+                    TODO('Support CMap ranges');
+                    break;
 
-              case 'endbfrange':
-                for (var j = 0; j < tokens.length; j += 3) {
-                  var startRange = parseInt('0x' + tokens[j]);
-                  var endRange = parseInt('0x' + tokens[j + 1]);
-                  var code = parseInt('0x' + tokens[j + 2]);
+                  case 'endbfrange':
+                    for (var j = 0; j < tokens.length; j += 3) {
+                      var startRange = parseInt('0x' + tokens[j]);
+                      var endRange = parseInt('0x' + tokens[j + 1]);
+                      var code = parseInt('0x' + tokens[j + 2]);
+                    }
+                    break;
 
-                  for (var k = startRange; k <= endRange; k++) {
-                    charset.push(encoding[code++] || '.notdef');
-                  }
+                  case 'endbfchar':
+                    for (var j = 0; j < tokens.length; j += 2) {
+                      var index = parseInt('0x' + tokens[j]);
+                      var code = parseInt('0x' + tokens[j + 1]);
+
+                      toUnicode[index] = code;
+                    }
+                    break;
+
+                  default:
+                    if (token.length) {
+                      tokens.push(token);
+                      token = '';
+                    }
+                    break;
                 }
-                break;
-
-              case 'endbfchar':
-                for (var j = 0; j < tokens.length; j += 2) {
-                  var index = parseInt('0x' + tokens[j]);
-                  var code = parseInt('0x' + tokens[j + 1]);
-                  encodingMap[index] = GlyphsUnicode[encoding[code]];
-                  charset.push(encoding[code] || '.notdef');
-                }
-                break;
-
-              default:
-                if (token.length) {
-                  tokens.push(token);
-                  token = '';
-                }
-                break;
+              } else if (byte == 0x5B || byte == 0x5D) {
+                byte = cmap[++i];
+                while (byte != 0x5B && byte != 0x5D)
+                  byte = cmap[++i];
+                TODO('CMAP list parsing is not implemented');
+              } else {
+                token += String.fromCharCode(byte);
               }
-            } else if (byte == 0x5B || byte == 0x5D) {
-              error('CMAP list parsing is not implemented');
-            } else {
-              token += String.fromCharCode(byte);
             }
           }
         }
@@ -4330,6 +4313,16 @@ var PartialEvaluator = (function() {
           }
         };
       }
+      
+      /*
+      // firstChar and width are required
+      // (except for 14 standard fonts)
+      var firstChar = xref.fetchIfRef(fontDict.get('FirstChar'));
+      var widths = xref.fetchIfRef(fontDict.get('Widths')) || [];
+      for (var j = 0; j < widths.length; j++) 
+        if (widths[j])
+          charset.push(encoding[j + firstChar]);
+      */
 
       var descriptor = xref.fetch(fd);
 
@@ -4369,6 +4362,9 @@ var PartialEvaluator = (function() {
         subtype: fileType,
         widths: glyphWidths,
         encoding: encodingMap,
+        baseEncoding: baseEncoding,
+        diffEncoding: diffEncoding,
+        toUnicode: toUnicode,
         charset: charset,
         firstChar: fontDict.get('FirstChar'),
         lastChar: fontDict.get('LastChar'),

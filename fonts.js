@@ -438,6 +438,9 @@ var Font = (function Font() {
         break;
     }
 
+    if (!this.encoding)
+      this.encoding = this.createEncoding(properties);
+
     this.data = data;
     this.type = properties.type;
     this.textMatrix = properties.textMatrix;
@@ -1305,6 +1308,53 @@ var Font = (function Font() {
 
       // Enter the translated string into the cache
       return charsCache[chars] = str;
+    },
+    createEncoding: function fonts_createEncoding(properties) {
+      // first see if BaseEncoding is given
+      var base = properties.baseEncoding;
+      // next check if font file specified an encoding
+      if (!base)
+        base = properties.fontEncoding;
+      // use the default encoding, which is chosen based upon the type of file
+      if (!base) {
+        if (properties.builtIn) {
+          // Do something
+        } else if (properties.type == 'TrueType') {
+          base = Encodings.WinAnsiEncoding.slice(0);
+        } else if (properties.type == 'Type1') {
+          base = Encodings.StandardEncoding.slice(0);
+        } else {
+          error('Unknown type of font');
+        }
+      }
+
+      // merge in the differences
+      var diffEncoding = properties.diffEncoding;
+      if (diffEncoding) {
+        for (var i = 0, ii = diffEncoding.length; i < ii; ++i) {
+          var glyph = diffEncoding[i];
+          if (glyph)
+            base[i] = glyph;
+        }
+      }
+
+      var encoding = [];
+      for (var i = 0, ii = base.length; i < ii; ++i) {
+        var glyph = base[i];
+        var unicode = GlyphsUnicode[glyph];
+        if (unicode)
+          encoding[i] = unicode;
+      }
+
+      var toUnicode = properties.toUnicode;
+      if (toUnicode) {
+        for (var i = 0, ii = toUnicode.length; i < ii; ++i) {
+          var unicode = toUnicode[i];
+          if (unicode)
+            encoding[i] = unicode;
+        }
+      }
+      return encoding;
     }
   };
 
